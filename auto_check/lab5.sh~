@@ -1,0 +1,89 @@
+export BASEOUTDIR=base_outputs
+export TESTOUTDIR=test_outputs
+export ASSEMBLY_EXT=s
+export PROGRAM_EXT=c
+export BASEPATH=/home/guohch/Desktop/EECS470/Project/project3/project-v-open
+export DUTPATH=/home/guohch/Desktop/EECS470/Project/final_project/milestone_4/milestone3
+
+function generate_base_outputs {
+    if ! [ -d $BASEOUTDIR ]; then
+        echo "$0: Making base outputs..."
+        mkdir $BASEOUTDIR
+		run_tests ${ASSEMBLY_EXT} ${BASEOUTDIR} assembly ${BASEPATH}
+#		run_tests ${PROGRAM_EXT} ${BASEOUTDIR} program ${BASEPATH}
+    fi
+}
+
+
+function run_tests {
+    extension=$1
+    output=$2
+    type=$3
+	dir=$4
+    echo "$0: Testing $type files"
+	cd $dir
+    for tst in test_progs/*.$extension; do
+        testname=$tst
+		testname=${testname##test_progs\/}
+        testname=${testname%%.${extension}}
+        echo "$0: Test: $testname"
+        make $type SOURCE=$tst 
+		make	
+		grep "@@@" program.out > /home/guohch/Desktop/EECS470/Project/final_project/milestone_4/milestone3/auto_check/$2/$testname.program.out
+        grep "CPI" program.out > /home/guohch/Desktop/EECS470/Project/final_project/milestone_4/milestone3/auto_check/$2/$testname.cpi.out
+		mv writeback.out /home/guohch/Desktop/EECS470/Project/final_project/milestone_4/milestone3/auto_check/$2/$testname.writeback.out 
+		make clean
+    done
+	cd /home/guohch/Desktop/EECS470/Project/final_project/milestone_4/milestone3/auto_check
+}
+
+
+function generate_test_outputs {
+    if [ -d $TESTOUTDIR ]; then
+        echo "$0: Deleting old test outputs from $TESTOUTDIR"
+		rm -r $TESTOUTDIR
+        mkdir $TESTOUTDIR  
+    else
+        mkdir $TESTOUTDIR
+    fi
+	run_tests ${ASSEMBLY_EXT} ${TESTOUTDIR} assembly ${DUTPATH}
+#	run_tests ${PROGRAM_EXT} ${TESTOUTDIR} program ${DUTPATH}
+}
+
+
+function compare_results {
+    printf "\TEST RESULTS:\n"
+    # compare results
+    pass_count=$((0))
+    fail_count=$((0))
+    total=$((0))
+    for tst in $BASEOUTDIR/*.program.out; do
+        testname=$tst
+        testname=${testname##${BASEOUTDIR}\/}
+        testname=${testname%%.program.out}
+        diff $tst $TESTOUTDIR/$testname.program.out > /dev/null
+        status_program=$?
+		tst=${tst%%.program.out}
+		tst=$tst".writeback.out"	
+        diff $tst $TESTOUTDIR/$testname.writeback.out > /dev/null
+        status_writeback=$? 
+	   	if [[ "$status_program" -eq "0" && "$status_writeback" -eq "0" ]]; then
+            echo -e "$0: Test $testname \e[32mPASSED\e[0m"
+            pass_count=$(($pass_count + 1))
+        else
+            echo -e "$0: Test $testname \e[31mFAILED\e[0m"
+            fail_count=$(($fail_count + 1))
+        fi
+        echo "BASE PERF `cat $BASEOUTDIR/$testname.cpi.out`"
+        echo "TEST PERF `cat $TESTOUTDIR/$testname.cpi.out`"
+        echo ""
+        total=$(($total + 1))
+    done
+    echo ""
+    echo "PASSED $pass_count/$total tests ($fail_count failures)."
+}
+
+
+generate_base_outputs
+generate_test_outputs
+compare_results
