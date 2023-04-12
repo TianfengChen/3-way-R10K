@@ -1,6 +1,9 @@
 /*
    wand_sel - Priority selector module.
 */
+`ifndef __WAND_SEL_V__
+`define __WAND_SEL_V__
+
 `timescale 1ns/100ps
 module wand_sel (req,gnt);
   //synopsys template
@@ -27,3 +30,4 @@ module wand_sel (req,gnt);
   assign gnt_r[WIDTH-1] = req_r[WIDTH-1];
 
 endmodule
+`endif //__WAND_SEL_V__

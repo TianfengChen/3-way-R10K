@@ -1,7 +1,8 @@
 `ifndef __ONEHOT_ENC_V__
 `define __ONEHOT_ENC_V__
-
 `timescale 1ns/100ps
+
+
 
 module onehot_enc #(
 	parameter WIDTH = 16

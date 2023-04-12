@@ -6,6 +6,8 @@
   Module is parametrizable in the width of the request bus (WIDTH), and the
   number of simultaneous requests granted (REQS).
  */
+`ifndef __PSEL_GEN_V__
+`define __PSEL_GEN_V__
 
 `timescale 1ns/100ps
 module psel_gen ( // Inputs
@@ -96,3 +98,4 @@ module psel_gen ( // Inputs
   end
 
 endmodule
+`endif //__PSEL_GEN_V__

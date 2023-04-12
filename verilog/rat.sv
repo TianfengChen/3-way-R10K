@@ -1,193 +1,215 @@
 `timescale 1ns/100ps
 
 module rat(
-	input        				clock,          	                // the clock 							
-	input        				reset,          	                // reset signal			
-	input [(`N_WAY) * (`ARF_WIDTH)-1:0] 	op1_arn_in,       // from decoder
-	input [(`N_WAY) * (`ARF_WIDTH)-1:0] 	op2_arn_in,       // from decoder
-	input [(`N_WAY) * (`ARF_WIDTH)-1:0] 	dest_arn_in,       // from decoder
-  	input [(`ARF_SIZE) * (`PRF_WIDTH)-1:0] 	rrat_rename_table_in,    // from rrat
-    	input [`PRF_SIZE-1:0]   		prf_free_list,           // from prf
-    	input                   		rat_mispredict,          // from controller
-    	input [`N_WAY-1:0]   			inst_valid_in,       //asserted when IF is dispatching instruction
-    	input [`N_WAY-1:0]   			dest_arn_valid_in,       //asserted when IF is dispatching instruction
- 	input 								rs_rob_haz_stall,
-   	
+	input clk,
+	input rst_n,
 
-	output logic [(`N_WAY) * (`PRF_WIDTH)-1:0]    rat_op1_prn_out,   	// feed to rs
-	output logic [(`N_WAY) * (`PRF_WIDTH)-1:0]    rat_op2_prn_out,   	// feed to rs
-	output logic [(`N_WAY) * (`PRF_WIDTH)-1:0]    rat_dest_prn_out,       // feed to rs and RoB
-    	output logic [`N_WAY-1:0]   			dest_prn_valid_out,
-    	output logic [(`ARF_SIZE) * (`PRF_WIDTH)-1:0] rat_rename_table_out, 
-	output logic [(`N_WAY) * (`PRF_WIDTH)-1:0]    rat_pre_dest_prn_out       // feed to rs and RoB    
+	input 		[`ARF_WIDTH-1:0] 		ar_src1			[0:`MACHINE_WIDTH-1],
+	input 		[`ARF_WIDTH-1:0] 		ar_src2			[0:`MACHINE_WIDTH-1],
+	input 		[`ARF_WIDTH-1:0] 		ar_dest			[0:`MACHINE_WIDTH-1],
+	input 		[`MACHINE_WIDTH-1:0]	ar_src1_sel,	//does this inst use src1
+	input 		[`MACHINE_WIDTH-1:0]	ar_src2_sel,	//does this inst use src2
+	input 		DEST_REG_SEL	 		ar_dest_sel		[0:`MACHINE_WIDTH-1],	//does this inst has dest reg
+	input 		[`MACHINE_WIDTH-1:0]	ar_valid,	
+	output  	[`MACHINE_WIDTH-1:0]    ar_ready,	
+
+	output 		[`PRF_WIDTH-1:0] 		pr_src1			[0:`MACHINE_WIDTH-1],
+	output 		[`PRF_WIDTH-1:0] 		pr_src2			[0:`MACHINE_WIDTH-1],
+	output 		[`PRF_WIDTH-1:0] 		pr_dest			[0:`MACHINE_WIDTH-1],
+	output 		[`PRF_WIDTH-1:0] 		pr_dest_prev	[0:`MACHINE_WIDTH-1],
+	output 		[`MACHINE_WIDTH-1:0]	pr_valid,										
+	input		[`MACHINE_WIDTH-1:0]	pr_ready,
+
+	input 		[`PRF_WIDTH-1:0] 		free_prn		[0:`MACHINE_WIDTH-1],
+	input 		[`MACHINE_WIDTH-1:0]	free_prn_valid						,		
+	output		[`MACHINE_WIDTH-1:0]	free_prn_ready						,
+
+	input		[`PRF_WIDTH-1:0]		arch_rat		[0:`ARF_DEPTH-1]	,
+	input								recov_arch_st
 );
-	logic [`PRF_WIDTH-1:0] 		rename_table 		[0:`ARF_SIZE-1];       	// rename table
-    	logic [`PRF_WIDTH-1:0] 		rrat_rename_table 	[0:`ARF_SIZE-1];
-    	logic [`PRF_WIDTH-1:0]    	next_dest_prn 		[0:`N_WAY-1];       //get the dest_prn in rename_table
-    	logic [`PRF_WIDTH-1:0]    	next_op1_prn 		[0:`N_WAY-1];       // ensure the corresponding prn of op1
-    	logic [`PRF_WIDTH-1:0]    	next_op2_prn 		[0:`N_WAY-1];       // ensure the corresponding prn of op2
-    	logic [`PRF_WIDTH-1:0]     	pre_dest_prn		[0:`N_WAY-1];       //get the dest_prn in rename_table
-    	logic [`ARF_WIDTH-1:0]    	op1_arn			[0:`N_WAY-1];
-    	logic [`ARF_WIDTH-1:0]     	op2_arn			[0:`N_WAY-1];
-    	logic [`ARF_WIDTH-1:0]     	dest_arn		[0:`N_WAY-1];
 
-    	logic [(`PRF_SIZE) * (`N_WAY)-1:0] 	next_prf_entry_sel_bus;			//selected inst per superscalar lane*n ways
-    	logic [`PRF_SIZE-1:0] 			next_prf_entry_sel;
-    	logic [`PRF_SIZE-1:0] 			next_prf_entry_sel_bus_split	[0:`N_WAY-1];
-	logic [`PRF_WIDTH-1:0]			next_prf_entry_num		[0:`N_WAY-1];
 
-    	logic [`N_WAY-1:0]   			inst_valid;
+	reg		[`PRF_WIDTH-1:0]		rat					[0:`ARF_DEPTH-1]	;
 
-    
+	reg		[`PRF_WIDTH-1:0] 		next_pr_src1		[0:`MACHINE_WIDTH-1];
+	reg		[`PRF_WIDTH-1:0] 		next_pr_src2		[0:`MACHINE_WIDTH-1];
+	wire	[`PRF_WIDTH-1:0] 		next_pr_dest		[0:`MACHINE_WIDTH-1];
+	reg		[`PRF_WIDTH-1:0] 		next_pr_dest_prev	[0:`MACHINE_WIDTH-1];
+	wire	[`MACHINE_WIDTH-1:0]	next_pr_valid							;							
+	
+	
+				
 
-    psel_gen #(.REQS(`N_WAY), .WIDTH(`PRF_SIZE)) psel_sel_prf_entry(  	//select the top 2 entries and lowest 1 entry  //N in M
-		.req(prf_free_list),
-		.gnt(next_prf_entry_sel), 		//mux 3 in 96 ctrl signal
-		.gnt_bus(next_prf_entry_sel_bus),	//mux 3 in 96 ctrl signal
-		.empty()
-	);
-    // split next_prf_entry_sel_bus into N_WAY
-    always_comb begin
-	for(int i=0;i<`N_WAY;i=i+1) begin
-		next_prf_entry_sel_bus_split[i] = next_prf_entry_sel_bus[i*`PRF_SIZE +: `PRF_SIZE];	//split next_prf_entry_sel_bus
-		op1_arn[i]  = op1_arn_in[i*`ARF_WIDTH +: `ARF_WIDTH];
-		op2_arn[i]  = op2_arn_in[i*`ARF_WIDTH +: `ARF_WIDTH];
-		dest_arn[i] = dest_arn_in[i*`ARF_WIDTH +: `ARF_WIDTH];
-	end
-    end
 
-    onehot_enc #(`PRF_SIZE) onehot_enc_2(
-	.in(next_prf_entry_sel_bus_split[2]),
-	.out(next_prf_entry_num[2])
-    );
-    onehot_enc #(`PRF_SIZE) onehot_enc_1(
-	.in(next_prf_entry_sel_bus_split[1]),
-	.out(next_prf_entry_num[1])
-    );
-    onehot_enc #(`PRF_SIZE) onehot_enc_0(
-	.in(next_prf_entry_sel_bus_split[0]),
-	.out(next_prf_entry_num[0])
-    );
 
-    always_comb begin
-	for(int i=0;i<`ARF_SIZE;i=i+1) begin
-		rrat_rename_table[i] = rrat_rename_table_in[i*`PRF_WIDTH +: `PRF_WIDTH];
-	end
-    end
 
-    always_comb begin
-	inst_valid = inst_valid_in;
-	if((inst_valid_in[1] & dest_arn_valid_in[1]) & (inst_valid_in[2] & dest_arn_valid_in[2]) & (dest_arn[1]==dest_arn[2])) begin
-		inst_valid[2] = 1'b0;
-	end
-	if((inst_valid_in[0] & dest_arn_valid_in[0]) & (inst_valid_in[2] & dest_arn_valid_in[2]) & (dest_arn[0]==dest_arn[2])) begin
-		inst_valid[2] = 1'b0;
-	end
-	if((inst_valid_in[0] & dest_arn_valid_in[0]) & (inst_valid_in[1] & dest_arn_valid_in[1]) & (dest_arn[0]==dest_arn[1])) begin
-		inst_valid[0] = 1'b0;
-	end
-    end
-    // write modify ARN->PRN, 1.reset,  2. misprediction, 3. normal case
-    always_ff @(posedge clock) begin
-        if(reset) begin
-		for(int i=0;i<`ARF_SIZE;i=i+1) begin
-               		rename_table[i] <= `SD {`PRF_WIDTH{1'b0}};
+	genvar i;
+	generate
+		for(i=0;i<`MACHINE_WIDTH;i=i+1) begin
+			//TODO sel can be removed
+			assign next_pr_dest[i] 		= ar_dest_sel[i]==DEST_RD && ar_dest[i]!=`ZERO_REG ? free_prn[i] : 0;
+			assign next_pr_valid[i] 	= ar_valid[i]; //accept a free entry
+
+			assign pr_src1[i] 			= next_pr_src1[i]		;
+			assign pr_src2[i] 			= next_pr_src2[i] 		;
+			assign pr_dest[i] 			= next_pr_dest[i] 		;
+			assign pr_dest_prev[i] 		= next_pr_dest_prev[i]  ;
+			assign pr_valid[i] 			= next_pr_valid[i] 	 	;
+
+			//always@(posedge clk or negedge rst_n) begin
+			//	if(~rst_n) begin
+			//		pr_src1[i] 		<= 0;
+			//		pr_src2[i] 		<= 0;
+			//		pr_dest[i] 		<= 0;
+			//		pr_dest_prev[i] <= 0;
+			//		pr_valid[i] 	<= 0;
+			//	end
+			//	else begin
+			//		pr_src1[i] 		<= next_pr_src1[i]		 ;
+			//		pr_src2[i] 		<= next_pr_src2[i] 		 ;
+			//		pr_dest[i] 		<= next_pr_dest[i] 		 ;
+			//		pr_dest_prev[i] <= next_pr_dest_prev[i]  ;
+			//		pr_valid[i] 	<= next_pr_valid[i] 	 ;
+			//	end
+			//end
+
+			//ready when an inst is accepted and this inst has a dest reg and the dest reg is not x0
+			assign free_prn_ready[i] = ar_dest_sel[i]==DEST_RD & ar_dest[i]!=`ZERO_REG & ar_valid[i] & ar_ready==4'b1111;//TODO 
+			assign ar_ready[i] = pr_ready[i];
+			
+
 		end
-        end// if(reset)
 
-        else if(rat_mispredict) begin
-                rename_table <= `SD rrat_rename_table;
-        end// if(rat_mispredict)
-		
-        else begin
-            for(int k=0;k<`N_WAY;k=k+1) begin
-                if(~rs_rob_haz_stall & inst_valid[k] & dest_arn_valid_in[k])begin
-                	rename_table[dest_arn[k]] <= `SD next_prf_entry_num[k];
+		for(i=0;i<`ARF_DEPTH;i=i+1) begin	
+			always@(posedge clk or negedge rst_n) begin
+				if(~rst_n) 
+					rat[i] <= 0;
+				else if(recov_arch_st)
+					rat[i] <= arch_rat[i];
+				else begin 
+					//for WAW, write down the latest ar-pr maping
+					//ar_dest[0] --> ar_dest[3], oldest --> latest 
+					if(free_prn_valid[0] & free_prn_ready[0] & i==ar_dest[0]) //accept a free entry
+						rat[i] <= free_prn[0];
+					if(free_prn_valid[1] & free_prn_ready[1] & i==ar_dest[1]) //accept a free entry
+						rat[i] <= free_prn[1];
+					if(free_prn_valid[2] & free_prn_ready[2] & i==ar_dest[2]) //accept a free entry
+						rat[i] <= free_prn[2];
+					if(free_prn_valid[3] & free_prn_ready[3] & i==ar_dest[3]) //accept a free entry
+						rat[i] <= free_prn[3];
+				end
+			end
+
 		end
-	    end
+	
+	endgenerate
+
+
+	//zero ar must be mapped to zero pr
+	assert property (@(posedge clk) rst_n==1 |-> rat[0] == 0);
+
+	
+	
+	/***********************intra-group dependency check******************************/
+	always@(*) begin
+		if(ar_src1_sel[3]==1 && ar_dest_sel[2]==DEST_RD && ar_src1[3]==ar_dest[2])
+			next_pr_src1[3] = next_pr_dest[2];
+		else if(ar_src1_sel[3]==1 && ar_dest_sel[1]==DEST_RD && ar_src1[3]==ar_dest[1])
+			next_pr_src1[3] = next_pr_dest[1];
+		else if(ar_src1_sel[3]==1 && ar_dest_sel[0]==DEST_RD && ar_src1[3]==ar_dest[0])
+			next_pr_src1[3] = next_pr_dest[0];
+		else
+			next_pr_src1[3] = ar_src1_sel[3] ? rat[ar_src1[3]] : 0;
 	end
-    end
 
-    always_comb begin
-            pre_dest_prn[2] = rename_table[dest_arn[2]];
-            pre_dest_prn[1] = rename_table[dest_arn[1]];
-            pre_dest_prn[0] = rename_table[dest_arn[0]];
-	    if(dest_arn_valid_in[1] & dest_arn_valid_in[2] & (dest_arn[1]==dest_arn[2])) begin
-		pre_dest_prn[1] = next_prf_entry_num[2];
-	    end
-	    if(dest_arn_valid_in[0] & dest_arn_valid_in[2] & (dest_arn[0]==dest_arn[2])) begin
-		pre_dest_prn[0] = next_prf_entry_num[2];
-	    end
-	    if(dest_arn_valid_in[0] & dest_arn_valid_in[1] & (dest_arn[0]==dest_arn[1])) begin
-		pre_dest_prn[1] = next_prf_entry_num[0];
-	    end
-    end
-
-    always_comb begin
-        if(reset) begin // if reset
-		for(int i=0;i<`N_WAY;i=i+1) begin
-               		next_op1_prn[i]  = {`PRF_WIDTH{1'b0}};
-                	next_op2_prn[i]  = {`PRF_WIDTH{1'b0}};
-                	next_dest_prn[i] = {`PRF_WIDTH{1'b0}};
-		end
-        end
-        else if(rat_mispredict) begin // if rat_nuke
-            for(int i=0;i<`N_WAY;i=i+1) begin
-                next_op1_prn[i] = rrat_rename_table[op1_arn[i]];
-                next_op2_prn[i] = rrat_rename_table[op2_arn[i]];
-                next_dest_prn[i] = rrat_rename_table[dest_arn[i]];
-            end
-        end
-        else begin
-	    for(int i=0; i<`N_WAY; i=i+1) begin
-                if(~rs_rob_haz_stall & inst_valid_in[i]) begin
-                    next_dest_prn[i] = next_prf_entry_num[i];
-                    next_op1_prn[i]  = rename_table[op1_arn[i]];
-                    next_op2_prn[i]  = rename_table[op2_arn[i]];
-                end
-	        	else begin
-                    next_dest_prn[i] = {`PRF_WIDTH{1'b0}};
-                    next_op1_prn[i]  = {`PRF_WIDTH{1'b0}};
-                    next_op2_prn[i]  = {`PRF_WIDTH{1'b0}};
-	        end
-	    end
-        end
-
-
-        if(~rs_rob_haz_stall & inst_valid_in[0] & inst_valid_in[2] & dest_arn_valid_in[2]) begin // internal forwarding among op1_arn[1], op2_arn[1] and dest_arn[0]
-            if(op1_arn[0] == dest_arn[2])
-                next_op1_prn[0] = next_dest_prn[2];
-            if(op2_arn[0] == dest_arn[2])
-                next_op2_prn[0] = next_dest_prn[2];
-        end
-        
-        if(~rs_rob_haz_stall & inst_valid_in[1] & inst_valid_in[2] & dest_arn_valid_in[2]) begin // internal forwarding among op1_arn[2], op2_arn[2] and dest_arn[0]
-            if (op1_arn[1] == dest_arn[2])
-                next_op1_prn[1] = next_dest_prn[2];
-            if (op2_arn[1] == dest_arn[2])
-                next_op2_prn[1] = next_dest_prn[2];
-        end
-
-        if(~rs_rob_haz_stall & inst_valid_in[1] & inst_valid_in[0] & dest_arn_valid_in[0])begin // internal forwarding among op1_arn[2], op2_arn[2] and dest_arn[1]
-            if (op1_arn[1] == dest_arn[0])
-                next_op1_prn[1] = next_dest_prn[0];
-            if (op2_arn[1] == dest_arn[0])
-                next_op2_prn[1] = next_dest_prn[0];
-        end
-        
-    end
-
-
-    assign rat_op1_prn_out = {next_op1_prn[2], next_op1_prn[1], next_op1_prn[0]};
-    assign rat_op2_prn_out = {next_op2_prn[2], next_op2_prn[1], next_op2_prn[0]};
-    assign rat_dest_prn_out = {next_dest_prn[2], next_dest_prn[1], next_dest_prn[0]};
-    assign rat_pre_dest_prn_out = {pre_dest_prn[2], pre_dest_prn[1], pre_dest_prn[0]};
-    assign dest_prn_valid_out = dest_arn_valid_in & ~rs_rob_haz_stall;
-
-    always_comb begin
-	for(int i=0;i<`ARF_SIZE;i=i+1) begin
-		rat_rename_table_out[i*(`PRF_WIDTH) +: `PRF_WIDTH] = rename_table[i];
+	always@(*) begin
+		if(ar_src1_sel[2]==1 && ar_dest_sel[1]==DEST_RD && ar_src1[2]==ar_dest[1])
+			next_pr_src1[2] = next_pr_dest[1];
+		else if(ar_src1_sel[2]==1 && ar_dest_sel[0]==DEST_RD && ar_src1[2]==ar_dest[0])
+			next_pr_src1[2] = next_pr_dest[0];
+		else
+			next_pr_src1[2] = ar_src1_sel[2] ? rat[ar_src1[2]] : 0;
 	end
-    end
+
+	always@(*) begin
+		if(ar_src1_sel[1]==1 && ar_dest_sel[0]==DEST_RD && ar_src1[1]==ar_dest[0])
+			next_pr_src1[1] = next_pr_dest[0];
+		else
+			next_pr_src1[1] = ar_src1_sel[1] ? rat[ar_src1[1]] : 0;
+	end
+
+	always@(*) begin
+		next_pr_src1[0] = ar_src1_sel[0] ? rat[ar_src1[0]] : 0;
+	end
+
+
+
+
+	always@(*) begin
+		if(ar_src2_sel[3]==1 && ar_dest_sel[2]==DEST_RD && ar_src2[3]==ar_dest[2])
+			next_pr_src2[3] = next_pr_dest[2];
+		else if(ar_src2_sel[3]==1 && ar_dest_sel[1]==DEST_RD && ar_src2[3]==ar_dest[1])
+			next_pr_src2[3] = next_pr_dest[1];
+		else if(ar_src2_sel[3]==1 && ar_dest_sel[0]==DEST_RD && ar_src2[3]==ar_dest[0])
+			next_pr_src2[3] = next_pr_dest[0];
+		else
+			next_pr_src2[3] = ar_src2_sel[3] ? rat[ar_src2[3]] : 0;
+	end
+
+	always@(*) begin
+		if(ar_src2_sel[2]==1 && ar_dest_sel[1]==DEST_RD && ar_src2[2]==ar_dest[1])
+			next_pr_src2[2] = next_pr_dest[1];
+		else if(ar_src2_sel[2]==1 && ar_dest_sel[0]==DEST_RD && ar_src2[2]==ar_dest[0])
+			next_pr_src2[2] = next_pr_dest[0];
+		else
+			next_pr_src2[2] = ar_src2_sel[2] ? rat[ar_src2[2]] : 0;
+	end
+
+	always@(*) begin
+		if(ar_src2_sel[1]==1 && ar_dest_sel[0]==DEST_RD && ar_src2[1]==ar_dest[0])
+			next_pr_src2[1] = next_pr_dest[0];
+		else
+			next_pr_src2[1] = ar_src2_sel[1] ? rat[ar_src2[1]] : 0;
+	end
+
+	always@(*) begin
+		next_pr_src2[0] = ar_src2_sel[0] ? rat[ar_src2[0]] : 0;
+	end
+
+
+
+
+	always@(*) begin
+		if(ar_dest_sel[3]==DEST_RD && ar_dest_sel[2]==DEST_RD && ar_dest[3]==ar_dest[2])
+			next_pr_dest_prev[3] = next_pr_dest[2];
+		else if(ar_dest_sel[3]==DEST_RD && ar_dest_sel[1]==DEST_RD && ar_dest[3]==ar_dest[1])
+			next_pr_dest_prev[3] = next_pr_dest[1];
+		else if(ar_dest_sel[3]==DEST_RD && ar_dest_sel[0]==DEST_RD && ar_dest[3]==ar_dest[0])
+			next_pr_dest_prev[3] = next_pr_dest[0];
+		else
+			next_pr_dest_prev[3] = ar_dest_sel[3]==DEST_RD ? rat[ar_dest[3]] : 0;
+	end
+
+	always@(*) begin
+		if(ar_dest_sel[2]==DEST_RD && ar_dest_sel[1]==DEST_RD && ar_dest[2]==ar_dest[1])
+			next_pr_dest_prev[2] = next_pr_dest[1];
+		else if(ar_dest_sel[2]==DEST_RD && ar_dest_sel[0]==DEST_RD && ar_dest[2]==ar_dest[0])
+			next_pr_dest_prev[2] = next_pr_dest[0];
+		else
+			next_pr_dest_prev[2] = ar_dest_sel[2]==DEST_RD ? rat[ar_dest[2]] : 0;
+	end
+
+	always@(*) begin
+		if(ar_dest_sel[1]==DEST_RD && ar_dest_sel[0]==DEST_RD && ar_dest[1]==ar_dest[0])
+			next_pr_dest_prev[1] = next_pr_dest[0];
+		else
+			next_pr_dest_prev[1] = ar_dest_sel[1]==DEST_RD ? rat[ar_dest[1]] : 0;
+	end
+
+	always@(*) begin
+		next_pr_dest_prev[0] = ar_dest_sel[0]==DEST_RD ? rat[ar_dest[0]] : 0;
+	end
+
+	/***********************intra-group dependency check******************************/
 
 endmodule

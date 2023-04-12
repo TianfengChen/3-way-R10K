@@ -1,530 +1,388 @@
-//////////////////////////////////////////////////////////////////////////////
-//                                                                          //
-//   Modulename :  ROB.sv                                                    //
-//                                                                          //
-//  Description :  This module creates the Reorder Buffer reordering        // 
-//                 instruction after out of order execution to address the  //
-//                 control hazard in R10K Tomasulo Algorithm with superscal-// 
-//                 ar and early branch resolusion                           //
-//                 programmer: Tianfeng Chen (tfchen)                       //
-//////////////////////////////////////////////////////////////////////////////
 `timescale 1ns/100ps
+//TODO assert only one br is retired per cycle
+module rob(	//TODO ready accept
+	input 								clk											,
+	input 								rst_n										,
+	input 								pipe_flush									,
 
-module ROB(
-	//inputs
-        input	clock,
-        input	reset,
-////////input signals from ID stage
-	input	ID_EX_PACKET 			id_packet_in_2,
-	input	ID_EX_PACKET 			id_packet_in_1,
-	input	ID_EX_PACKET 			id_packet_in_0,
-////////input signals from CDB
-	input	[`N_WAY-1:0]			cdb_valid,
-	input	[(`N_WAY)*32-1:0]		cdb_value,
-	input	[(`N_WAY)*(`PRF_WIDTH)-1:0]	cdb_tag,
-	input	[(`N_WAY)*(`ROB_WIDTH)-1:0]	cdb_rob,
-	input	[`N_WAY-1:0]			cdb_cond_branch,
-	input	[`N_WAY-1:0]			cdb_uncond_branch,
-////////input signals from FU
-	input	[`XLEN-1:0]			FU_branch_target_addr,		
-	input 		  			FU_branch_taken,
-	input	[`XLEN-1:0]			FU_store_addr,
-	input	[63:0]				FU_store_data,
-	input					FU_store_en,
-	input	[`ROB_WIDTH-1:0]		FU_rob,
-////////input signals from Dcache_controller
-	input					store_commit_valid,
-	//outputs
-	output	logic	[(`N_WAY)*(`ROB_WIDTH)-1:0] ROB_num,	//to RS
-	output	logic	[`ROB_WIDTH:0]		rob_hazard_num,
-	output	logic				nuke,
-	output	EXCEPTION_CODE   		error_status,
-	output	logic	[3:0]			completed_insts,
-	output	ROB_PACKET			ROB_packet_out_2,
-	output	ROB_PACKET			ROB_packet_out_1,
-	output 	ROB_PACKET			ROB_packet_out_0,
-	output	ROB_IF_BRANCH_PACKET		ROB_branch_out_2,
-	output	ROB_IF_BRANCH_PACKET		ROB_branch_out_1,
-	output	ROB_IF_BRANCH_PACKET		ROB_branch_out_0,
-	output	logic	[`ROB_SIZE-1:0]		load_ready
+	input		DISPATCH_ROB_PACKET		dispatch_pkt			[0:`MACHINE_WIDTH-1],
+	output	reg	[`MACHINE_WIDTH-1:0]	dispatch_pkt_ready							,
+	output	reg	[`ROB_WIDTH:0]			dispatch_pkt_resp		[0:`MACHINE_WIDTH-1],	//rob entry#
+	output		RETIRE_ROB_PACKET		retire_pkt				[0:`MACHINE_WIDTH-1],
+
+	input		[`ROB_WIDTH:0]			writeback_rob_tag		[0:`ISSUE_WIDTH-1]	,
+	input		[`ISSUE_WIDTH-1:0]		writeback_valid								,
+	input								writeback_br_misp							,
+	input		[`XLEN-1:0]				writeback_redirect_pc
 );
-////////ROB state machine
-	logic	[`ROB_WIDTH-1:0]	head;
-	logic	[`ROB_WIDTH-1:0]	tail;
-	ROB_PACKET			ROB		[`ROB_SIZE];
-	logic	[`ROB_WIDTH-1:0]	next_head;
-	logic	[`ROB_WIDTH-1:0]	next_tail;
-	ROB_PACKET			next_ROB	[`ROB_SIZE];
-	logic				next_nuke;
-////////3-way superscalar dispatch
-	logic	[`N_WAY-1:0] [`ROB_WIDTH-1:0]	next_3_tail;
-	logic	[`N_WAY-1:0] [`ROB_WIDTH-1:0]	next_3_head;
-////////3-way commit
-	logic	[`N_WAY-1:0]		illegal_array;
-	logic	[`N_WAY-1:0]		halt_array;
-	logic	[`N_WAY-1:0]		commit_array;
-	logic	[`N_WAY-1:0]		nuke_array;
-	logic	[`N_WAY-1:0]		store_array;
-////////Store counter
-	logic	[`N_WIDTH-1:0]		fetch_cnt	[`N_WAY];
-	logic	[`N_WIDTH-1:0]		commit_cnt;
-	logic	[`ROB_WIDTH-1:0]	tail_cnt;
-	logic	[`ROB_WIDTH-1:0]	next_tail_cnt;
-	logic	[(`ROB_SIZE)*(`ROB_WIDTH)-1:0]	store_cnt;
-	logic	[(`ROB_SIZE)*(`ROB_WIDTH)-1:0]	next_store_cnt;
-////////Store commit
-	logic	[`N_WAY-1:0]		is_load;
-////////For DVE
-	logic	[`ROB_WIDTH-1:0]	next_store_cnt_dve	[`ROB_SIZE];
-	logic	[`ROB_WIDTH-1:0]	store_cnt_dve		[`ROB_SIZE];	
-	always_comb begin
-		for(int i=0;i<`ROB_SIZE;i=i+1) begin
-			next_store_cnt_dve[i] = next_store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH];
-			store_cnt_dve[i]      = store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH];			
+
+
+	ROB_ENTRY						rob_entry		[0:`ROB_DEPTH-1];
+	ROB_ENTRY						dispatch_2_rob	[0:`MACHINE_WIDTH-1];
+
+	reg		[`ROB_WIDTH-1:0]		head_ptr;	
+	reg		[`ROB_WIDTH-1:0]		tail_ptr;
+	reg								head_position_bit;
+	reg								tail_position_bit;
+	wire	[`ROB_WIDTH-1:0]		next_head_ptr;	
+	wire	[`ROB_WIDTH-1:0]		next_tail_ptr;
+	wire							next_head_position_bit;
+	wire							next_tail_position_bit;
+	wire							head_ptr_overflow;	
+	wire							tail_ptr_overflow;	
+	reg		[`ROB_WIDTH-1:0]		head_ptr_plus1;	
+	reg		[`ROB_WIDTH-1:0]		head_ptr_plus2;	
+	reg		[`ROB_WIDTH-1:0]		head_ptr_plus3;	
+	reg		[`ROB_WIDTH-1:0]		tail_ptr_plus1;	
+	reg		[`ROB_WIDTH-1:0]		tail_ptr_plus2;	
+	reg		[`ROB_WIDTH-1:0]		tail_ptr_plus3;	
+
+	wire	[`MACHINE_WIDTH:0]		dispatch_pkt_cnt;
+
+	wire	[`MACHINE_WIDTH-1:0]	retire_en;
+	wire	[`MACHINE_WIDTH:0]		retire_en_cnt;
+	wire  	[`MACHINE_WIDTH-1:0]	br_mask;	//only one branch instr is allowed to retire every cycle
+	wire	[`MACHINE_WIDTH-1:0]	flush_en_N;	//flush_en per way
+	wire							flush_en;
+
+	reg		[`ROB_WIDTH:0]			misp_rob; //the rob tag of misp br
+	reg								branch_misp; //there are unretired misp br	
+	reg		[`XLEN-1:0]				redirect_pc; //the correct next pc for pipeline
+
+
+	assign dispatch_pkt_cnt = 		dispatch_pkt[3].packet_valid +
+									dispatch_pkt[2].packet_valid +
+									dispatch_pkt[1].packet_valid +
+									dispatch_pkt[0].packet_valid ;
+
+	assign retire_en_cnt = 			retire_en[3] +
+									retire_en[2] +
+									retire_en[1] +
+									retire_en[0] ;
+
+	//TODO
+	assign retire_en[0]	=	rob_entry[head_ptr].valid && rob_entry[head_ptr].complete && br_mask[0];
+	assign retire_en[1]	=	retire_en[0] && ~flush_en_N[0] && rob_entry[head_ptr_plus1].valid && rob_entry[head_ptr_plus1].complete && br_mask[1];
+	assign retire_en[2]	=	retire_en[1] && ~flush_en_N[1] && rob_entry[head_ptr_plus2].valid && rob_entry[head_ptr_plus2].complete && br_mask[2];
+	assign retire_en[3]	=	retire_en[2] && ~flush_en_N[2] && rob_entry[head_ptr_plus3].valid && rob_entry[head_ptr_plus3].complete && br_mask[3];
+
+	assign br_mask[0]	= 	1'b1;
+	assign br_mask[1]	=  	rob_entry[head_ptr].branch + 
+							rob_entry[head_ptr_plus1].branch <= 1;
+	assign br_mask[2]	=  	rob_entry[head_ptr].branch + 
+							rob_entry[head_ptr_plus1].branch +  
+							rob_entry[head_ptr_plus2].branch <= 1;  
+	assign br_mask[3]	=  	rob_entry[head_ptr].branch +
+							rob_entry[head_ptr_plus1].branch +
+   							rob_entry[head_ptr_plus2].branch +
+							rob_entry[head_ptr_plus3].branch <= 1;
+									
+	assign next_tail_ptr = tail_ptr + dispatch_pkt_cnt;
+	assign next_head_ptr = head_ptr + retire_en_cnt;
+	assign next_tail_position_bit = tail_ptr_overflow ? ~tail_position_bit : tail_position_bit;
+	assign next_head_position_bit = head_ptr_overflow ? ~head_position_bit : head_position_bit;
+
+	//TODO dont have to be 4'b1111
+	//assign tail_ptr_overflow = tail_ptr[5:2]==4'b1111 && next_tail_ptr[5]==0;
+	//assign head_ptr_overflow = head_ptr[5:2]==4'b1111 && next_head_ptr[5]==0;
+	assign head_ptr_overflow = head_ptr[`ROB_WIDTH-1:`MACHINE_IDX]=={(`ROB_WIDTH-`MACHINE_IDX){1'b1}} && next_head_ptr[`ROB_WIDTH-1]==0;
+	assign tail_ptr_overflow = tail_ptr[`ROB_WIDTH-1:`MACHINE_IDX]=={(`ROB_WIDTH-`MACHINE_IDX){1'b1}} && next_tail_ptr[`ROB_WIDTH-1]==0;
+
+	assign flush_en = flush_en_N != 0;	
+
+	assign head_ptr_plus1 = head_ptr + 1;
+	assign head_ptr_plus2 = head_ptr + 2;
+	assign head_ptr_plus3 = head_ptr + 3;
+	assign tail_ptr_plus1 = tail_ptr + 1;
+	assign tail_ptr_plus2 = tail_ptr + 2;
+	assign tail_ptr_plus3 = tail_ptr + 3;
+			
+
+
+
+	always@(*) begin
+		if(branch_misp) begin
+		//if(sys_exception|retire_exception) begin  //remove branch_misp to expose more bugs
+			dispatch_pkt_ready[0] =	0;
+			dispatch_pkt_ready[1] =	0;
+			dispatch_pkt_ready[2] =	0;
+			dispatch_pkt_ready[3] =	0;
 		end
-	end
-////////determine tails
-	always_comb begin
-		casez({`ROB_WIDTH{1'b1}}-tail)
-			0: begin
-				next_3_tail[2] = 0;
-				next_3_tail[1] = 1;
-				next_3_tail[0] = 2;
-			end	
-			1: begin
-				next_3_tail[2] = {`ROB_WIDTH{1'b1}};
-				next_3_tail[1] = 0;
-				next_3_tail[0] = 1;
-			end
-			2: begin
-				next_3_tail[2] = {{(`ROB_WIDTH-1){1'b1}},1'b0};
-				next_3_tail[1] = {`ROB_WIDTH{1'b1}};
-				next_3_tail[0] = 0;
-			end
-			default: begin
-				next_3_tail[2] = tail+1;
-				next_3_tail[1] = tail+2;
-				next_3_tail[0] = tail+3;
-			end
-		endcase
-	end
-////////determing heads	
-	always_comb begin
-		casez({`ROB_WIDTH{1'b1}}-head)
-			0: begin
-				next_3_head[2] = 0;
-				next_3_head[1] = 1;
-				next_3_head[0] = 2;
-			end	
-			1: begin
-				next_3_head[2] = {`ROB_WIDTH{1'b1}};
-				next_3_head[1] = 0;
-				next_3_head[0] = 1;
-			end
-			2: begin
-				next_3_head[2] = {{(`ROB_WIDTH-1){1'b1}},1'b0};
-				next_3_head[1] = {`ROB_WIDTH{1'b1}};
-				next_3_head[0] = 0;
-			end
-			default: begin
-				next_3_head[2] = head+1;
-				next_3_head[1] = head+2;
-				next_3_head[0] = head+3;
-			end
-		endcase
-	end
-
-	always_comb begin
-		for(int i=0;i<`ROB_SIZE;i=i+1) begin
-			next_ROB[i] = ROB[i];
-////////////////////////ROB fetch
-			if(i==tail) begin
-				if(id_packet_in_2.valid) begin
-					next_ROB[i].id_packet			= id_packet_in_2;
-					next_ROB[i].valid	   		= id_packet_in_2.valid;
-					next_ROB[i].commit			= (id_packet_in_2.halt | id_packet_in_2.illegal) ? 1 : 0;
-					next_ROB[i].branch_true_taken 		= 1'b0;
-					next_ROB[i].branch_true_target_PC 	= {`XLEN{1'b0}};
-					next_ROB[i].branch_mispredict 		= 1'b0;
-					next_ROB[i].branch_true_PC 		= {`XLEN{1'b0}};
-					next_ROB[i].proc2mem_addr 		= {`XLEN{1'b0}};
-					next_ROB[i].proc2mem_data 		= 64'b0;
-					next_ROB[i].proc2mem_size 		= DOUBLE;
-				end
-			end//if(i==tail)
-			if(i==next_3_tail[2]) begin
-				if(id_packet_in_1.valid) begin
-					next_ROB[i].id_packet 			= id_packet_in_1;
-					next_ROB[i].valid	 		= id_packet_in_1.valid;
-					next_ROB[i].commit    			= (id_packet_in_1.halt | id_packet_in_1.illegal) ? 1 : 0;
-					next_ROB[i].branch_true_taken 		= 1'b0;
-					next_ROB[i].branch_true_target_PC 	= {`XLEN{1'b0}};
-					next_ROB[i].branch_mispredict 		= 1'b0;
-					next_ROB[i].branch_true_PC 		= {`XLEN{1'b0}};
-					next_ROB[i].proc2mem_addr 		= {`XLEN{1'b0}};
-					next_ROB[i].proc2mem_data 		= 64'b0;
-					next_ROB[i].proc2mem_size 		= DOUBLE;
-				end
-			end//if(i==next_3_tail[2])
-			if(i==next_3_tail[1]) begin
-				if(id_packet_in_0.valid) begin
-					next_ROB[i].id_packet 			= id_packet_in_0;
-					next_ROB[i].valid	   		= id_packet_in_0.valid;
-					next_ROB[i].commit    			= (id_packet_in_0.halt | id_packet_in_0.illegal) ? 1 : 0;
-					next_ROB[i].branch_true_taken 		= 1'b0;
-					next_ROB[i].branch_true_target_PC 	= {`XLEN{1'b0}};
-					next_ROB[i].branch_mispredict 		= 1'b0;
-					next_ROB[i].branch_true_PC		= {`XLEN{1'b0}};
-					next_ROB[i].proc2mem_addr 		= {`XLEN{1'b0}};
-					next_ROB[i].proc2mem_data 		= 64'b0;
-					next_ROB[i].proc2mem_size 		= DOUBLE;
-				end
-			end//if(i==next_3_tail[1])
-////////////////////////ROB get CDB broadcast
-			for(int a=0;a<`N_WAY;a=a+1) begin
-				if(i==cdb_rob[a*`ROB_WIDTH +: `ROB_WIDTH]) begin
-					if(cdb_valid[a] | cdb_cond_branch[a]) begin
-						next_ROB[i].commit = 1'b1;
-					end//if(cdb_valid[a])
-					if((cdb_valid[a] | cdb_cond_branch[a]) & (cdb_uncond_branch[a] | cdb_cond_branch[a])) begin
-						next_ROB[i].branch_true_taken 		= FU_branch_taken;
-						next_ROB[i].branch_true_target_PC 	= FU_branch_target_addr;
-						if(ROB[i].id_packet.branch_predict) begin
-							if(FU_branch_taken) begin
-								if(ROB[i].id_packet.predict_PC == FU_branch_target_addr) begin
-									next_ROB[i].branch_mispredict 	= 1'b0;
-									next_ROB[i].branch_true_PC	= FU_branch_target_addr;
-								end//PC is same
-								else begin
-									next_ROB[i].branch_mispredict 	= 1'b1;
-									next_ROB[i].branch_true_PC 	= FU_branch_target_addr;
-								end//PC is not same
-							end//actuall taken
-							else begin
-								next_ROB[i].branch_mispredict 	= 1'b1;
-								next_ROB[i].branch_true_PC 	= ROB[i].id_packet.NPC;
-							end//actually not taken
-						end//predicted taken
-						else begin
-							if(FU_branch_taken) begin
-								next_ROB[i].branch_mispredict 	= 1'b1;
-								next_ROB[i].branch_true_PC 	= FU_branch_target_addr;
-							end//actually taken
-							else begin
-								next_ROB[i].branch_mispredict 	= 1'b0;
-								next_ROB[i].branch_true_PC 	= ROB[i].id_packet.NPC;
-							end//actully not taken
-						end//predicted not taken
-					end//if((cdb_valid[a] | cdb_cond_branch[a]) & (cdb_uncond_branch[a] | cdb_cond_branch[a]))
-				end//if(i=cdb_rob[a])
-				if(i==FU_rob & FU_store_en) begin
-					next_ROB[i].commit = 1'b1;
-					next_ROB[i].proc2mem_addr = FU_store_addr;
-					next_ROB[i].proc2mem_data = FU_store_data;
-					next_ROB[i].proc2mem_size = ROB[i].id_packet.inst.r.funct3; 
-				end//if(i==FU_rob & FU_store_en) begin
-			end//for(int a=0;a<`N_WAY;a=a+1)
-////////////////////////ROB commit
-			if(i==head) begin
-				if(commit_array[2]) begin
-					if(is_load[2] & store_commit_valid==0) begin
-						next_ROB[i].commit = 1'b1;
-						next_ROB[i].valid  = 1'b1;	
-					end
-					else begin
-						next_ROB[i].commit = 1'b0;
-						next_ROB[i].valid  = 1'b0;	
-					end
-				end
-			end//if(i==head)
-			if(i==next_3_head[2]) begin
-				if(commit_array[1]) begin
-					if(is_load[1] & store_commit_valid==0) begin
-						next_ROB[i].commit = 1'b1;
-						next_ROB[i].valid  = 1'b1;
-					end
-					else if(is_load[2]) begin
-						next_ROB[i].commit = 1'b1;
-						next_ROB[i].valid  = 1'b1;
-					end
-					else begin
-						next_ROB[i].commit = 1'b0;
-						next_ROB[i].valid  = 1'b0;	
-					end
-				end
-			end//if(i==next_3_head[2])
-			if(i==next_3_head[1]) begin
-				if(commit_array[0]) begin
-					if(is_load[0] & store_commit_valid==0) begin
-						next_ROB[i].commit = 1'b1;
-						next_ROB[i].valid  = 1'b1;
-					end
-					else if(is_load[2] | is_load[1]) begin
-						next_ROB[i].commit = 1'b1;
-						next_ROB[i].valid  = 1'b1;
-					end
-					else begin
-						next_ROB[i].commit = 1'b0;
-						next_ROB[i].valid  = 1'b0;	
-					end
-				end
-			end//if(i==next_3_head[1])
-		end//for(int i=0;i<`ROB_SIZE;i=i+1)
-	end
-////////ROB commit
-	assign	commit_array[2]  = ROB[head].valid & ROB[head].commit & ~nuke;
-	assign	illegal_array[2] = commit_array[2] & ROB[head].id_packet.illegal;
-	assign	halt_array[2]	 = commit_array[2] & ~illegal_array[2] & ROB[head].id_packet.halt;
-	assign	nuke_array[2]	 = commit_array[2] & (halt_array[2] | illegal_array[2] | ROB[head].branch_mispredict);
-
-	assign	commit_array[1]  = ROB[next_3_head[2]].valid & ROB[next_3_head[2]].commit & commit_array[2] & ~nuke_array[2] & ~ROB[head].id_packet.wr_mem & ~ROB[next_3_head[2]].id_packet.halt;
-	assign	illegal_array[1] = commit_array[1] & ROB[next_3_head[2]].id_packet.illegal;
-	assign	halt_array[1]	 = commit_array[1] & ~illegal_array[1] & ROB[next_3_head[2]].id_packet.halt;
-	assign	nuke_array[1]	 = commit_array[1] & (halt_array[1] | illegal_array[1] | ROB[next_3_head[2]].branch_mispredict);
-
-	assign	commit_array[0]  = ROB[next_3_head[1]].valid & ROB[next_3_head[1]].commit & commit_array[1] & ~nuke_array[1] & ~(ROB[head].id_packet.wr_mem | ROB[next_3_head[2]].id_packet.wr_mem) & ~ROB[next_3_head[1]].id_packet.halt;
-	assign	illegal_array[0] = commit_array[0] & ROB[next_3_head[1]].id_packet.illegal;
-	assign	halt_array[0]	 = commit_array[0] & ~illegal_array[0] & ROB[next_3_head[1]].id_packet.halt;
-	assign	nuke_array[0]	 = commit_array[0] & (halt_array[0] | illegal_array[0] | ROB[next_3_head[1]].branch_mispredict);
-
-	assign	is_load		 = {commit_array[2]&ROB[head].id_packet.wr_mem,commit_array[1]&ROB[next_3_head[2]].id_packet.wr_mem,commit_array[0]&ROB[next_3_head[1]].id_packet.wr_mem};
-
-	always_comb begin
-		ROB_packet_out_2 = ROB[head];
-		ROB_packet_out_1 = ROB[next_3_head[2]];
-		ROB_packet_out_0 = ROB[next_3_head[1]];
-		if(commit_array[2] == 0 | illegal_array[2] == 1)
-			ROB_packet_out_2.commit = 1'b0;
-		if(commit_array[1] == 0 | illegal_array[1] == 1)
-			ROB_packet_out_1.commit = 1'b0;
-		if(commit_array[0] == 0 | illegal_array[0] == 1)
-			ROB_packet_out_0.commit = 1'b0;
-	end
-
-	always_comb begin
-		if(commit_array[2]) begin
-			ROB_branch_out_2.uncond_branch = ROB[head].id_packet.uncond_branch;
-			ROB_branch_out_2.cond_branch = ROB[head].id_packet.cond_branch;
-			ROB_branch_out_2.branch_is_taken = ROB[head].id_packet.branch_predict;
-			ROB_branch_out_2.branch_PC = ROB[head].id_packet.PC;
-			ROB_branch_out_2.branch_target_PC = ROB[head].id_packet.predict_PC;
-			ROB_branch_out_2.branch_true_taken = ROB[head].branch_true_taken;
-			ROB_branch_out_2.branch_true_target_PC = ROB[head].branch_true_target_PC;
-			ROB_branch_out_2.branch_misprediction = ROB[head].branch_mispredict;
-			ROB_branch_out_2.branch_true_PC = ROB[head].branch_true_PC;
+		else if(next_head_position_bit==next_tail_position_bit) begin
+			dispatch_pkt_ready[0] =	~((next_head_ptr+`ROB_DEPTH-next_tail_ptr)==0); 
+            dispatch_pkt_ready[1] =	~((next_head_ptr+`ROB_DEPTH-next_tail_ptr)<=1);
+            dispatch_pkt_ready[2] =	~((next_head_ptr+`ROB_DEPTH-next_tail_ptr)<=2);
+            dispatch_pkt_ready[3] =	~((next_head_ptr+`ROB_DEPTH-next_tail_ptr)<=3);
 		end
 		else begin
-			ROB_branch_out_2 = {
-				1'b0,		//uncond_branch
-				1'b0,		//cond_branch
-				1'b0,		//branch_is_taken
-				{`XLEN{1'b0}},	//branch_PC
-				{`XLEN{1'b0}},	//branch_target_PC
-				1'b0,		//branch_true_taken
-				{`XLEN{1'b0}},	//branch_true_target_PC
-				1'b0,		//branch_misprediction
-				{`XLEN{1'b0}}	//branch_true_PC
-				};
+			dispatch_pkt_ready[0] =	~((next_head_ptr-next_tail_ptr)==0); 
+            dispatch_pkt_ready[1] =	~((next_head_ptr-next_tail_ptr)<=1);
+            dispatch_pkt_ready[2] =	~((next_head_ptr-next_tail_ptr)<=2);
+            dispatch_pkt_ready[3] =	~((next_head_ptr-next_tail_ptr)<=3);
+		end
+	end
+
+
+	always@(posedge clk or negedge rst_n) begin
+		if(~rst_n) begin
+			tail_ptr <= 0;
+			head_ptr <= 0;
+		end
+		else if(pipe_flush) begin
+			tail_ptr <= 0;
+			head_ptr <= 0;
+		end
+		else begin
+			tail_ptr <= next_tail_ptr;
+			head_ptr <= next_head_ptr;
+		end
+	end
+
+
+	always@(posedge clk or negedge rst_n) begin
+		if(~rst_n)
+			tail_position_bit <= 0;
+		else if(pipe_flush)
+			tail_position_bit <= 0;
+		else
+			tail_position_bit <= next_tail_position_bit;
+	end
+
+
+	always@(posedge clk or negedge rst_n) begin
+		if(~rst_n)
+			head_position_bit <= 0;
+		else if(pipe_flush)
+			head_position_bit <= 0;
+		else
+			head_position_bit <= next_head_position_bit;
+	end
+
+
+	always@(posedge clk) begin
+		if(~rst_n)
+			branch_misp <= 0;
+		if(pipe_flush) begin
+			branch_misp <= 0;
+			redirect_pc <= 0;
+			misp_rob	<= 0;
+		end
+		else if(writeback_valid && writeback_br_misp) begin //only update the first misp br target pc
+			if(~branch_misp) begin
+				branch_misp <= 1;
+				redirect_pc <= writeback_redirect_pc;
+				misp_rob	<= writeback_rob_tag[5];
+			end
+			//update redirect pc if a younger misp br is found
+			else if((misp_rob[`ROB_WIDTH]==writeback_rob_tag[5][`ROB_WIDTH] && 
+					writeback_rob_tag[5][`ROB_WIDTH-1:0]<misp_rob[`ROB_WIDTH-1:0]) ||
+					(misp_rob[`ROB_WIDTH]!=writeback_rob_tag[5][`ROB_WIDTH] && 
+					writeback_rob_tag[5][`ROB_WIDTH-1:0]>misp_rob[`ROB_WIDTH-1:0])) begin	
+					redirect_pc <= writeback_redirect_pc;
+					misp_rob	<= writeback_rob_tag[5];
+			end
+		end
+	end
+
+
+	genvar i;
+	generate
+		for(i=0;i<`MACHINE_WIDTH;i=i+1) begin
+			assign dispatch_2_rob[i].pc 			=	dispatch_pkt[i].pc 							;
+			assign dispatch_2_rob[i].dest_arn 		= 	dispatch_pkt[i].dest_arn 					;
+			assign dispatch_2_rob[i].dest_prn 		= 	dispatch_pkt[i].dest_prn 					;
+			assign dispatch_2_rob[i].dest_prn_prev 	= 	dispatch_pkt[i].dest_prn_prev 				;
+			assign dispatch_2_rob[i].stq_tag 		= 	dispatch_pkt[i].stq_tag		 				;
+			assign dispatch_2_rob[i].ldq_tag 		= 	dispatch_pkt[i].ldq_tag		 				;
+			assign dispatch_2_rob[i].rd_mem			= 	dispatch_pkt[i].rd_mem						;
+			assign dispatch_2_rob[i].wr_mem 		= 	dispatch_pkt[i].wr_mem 						;
+			assign dispatch_2_rob[i].branch			= 	dispatch_pkt[i].cond_branch | 
+													   	dispatch_pkt[i].uncond_branch				;
+			assign dispatch_2_rob[i].branch_misp 	= 	1'b0						 				;
+			assign dispatch_2_rob[i].exception 		= 	dispatch_pkt[i].halt 	? 	HALTED_ON_WFI 	:
+				 							   		   	dispatch_pkt[i].illegal ? 	ILLEGAL_INST	:
+				 							   	   	 								NO_ERROR		;
+			assign dispatch_2_rob[i].complete 		= 	dispatch_pkt[i].inst == `NOP ||
+														dispatch_2_rob[i].exception != NO_ERROR		;	
+			assign dispatch_2_rob[i].valid 			= 	dispatch_pkt[i].packet_valid 				;
+
+			assign flush_en_N[i] = (retire_pkt[i].packet_valid && (retire_pkt[i].branch_misp || retire_pkt[i].exception!=NO_ERROR));			
 		end
 
-		if(commit_array[1]) begin
-			ROB_branch_out_1.uncond_branch = ROB[next_3_head[2]].id_packet.uncond_branch;
-			ROB_branch_out_1.cond_branch = ROB[next_3_head[2]].id_packet.cond_branch;
-			ROB_branch_out_1.branch_is_taken = ROB[next_3_head[2]].id_packet.branch_predict;
-			ROB_branch_out_1.branch_PC = ROB[next_3_head[2]].id_packet.PC;
-			ROB_branch_out_1.branch_target_PC = ROB[next_3_head[2]].id_packet.predict_PC;
-			ROB_branch_out_1.branch_true_taken = ROB[next_3_head[2]].branch_true_taken;
-			ROB_branch_out_1.branch_true_target_PC = ROB[next_3_head[2]].branch_true_target_PC;
-			ROB_branch_out_1.branch_misprediction = ROB[next_3_head[2]].branch_mispredict;
-			ROB_branch_out_1.branch_true_PC = ROB[next_3_head[2]].branch_true_PC;
-		end
-		else begin
-			ROB_branch_out_1 = {
-				1'b0,		//uncond_branch
-				1'b0,		//cond_branch
-				1'b0,		//branch_is_taken
-				{`XLEN{1'b0}},	//branch_PC
-				{`XLEN{1'b0}},	//branch_target_PC
-				1'b0,		//branch_true_taken
-				{`XLEN{1'b0}},	//branch_true_target_PC
-				1'b0,		//branch_misprediction
-				{`XLEN{1'b0}}	//branch_true_PC
-				};
-		end
 
-		if(commit_array[0]) begin
-			ROB_branch_out_0.uncond_branch = ROB[next_3_head[1]].id_packet.uncond_branch;
-			ROB_branch_out_0.cond_branch = ROB[next_3_head[1]].id_packet.cond_branch;
-			ROB_branch_out_0.branch_is_taken = ROB[next_3_head[1]].id_packet.branch_predict;
-			ROB_branch_out_0.branch_PC = ROB[next_3_head[1]].id_packet.PC;
-			ROB_branch_out_0.branch_target_PC = ROB[next_3_head[1]].id_packet.predict_PC;
-			ROB_branch_out_0.branch_true_taken = ROB[next_3_head[1]].branch_true_taken;
-			ROB_branch_out_0.branch_true_target_PC = ROB[next_3_head[1]].branch_true_target_PC;
-			ROB_branch_out_0.branch_misprediction = ROB[next_3_head[1]].branch_mispredict;
-			ROB_branch_out_0.branch_true_PC = ROB[next_3_head[1]].branch_true_PC;
-		end
-		else begin
-			ROB_branch_out_0 = {
-				1'b0,		//uncond_branch
-				1'b0,		//cond_branch
-				1'b0,		//branch_is_taken
-				{`XLEN{1'b0}},	//branch_PC
-				{`XLEN{1'b0}},	//branch_target_PC
-				1'b0,		//branch_true_taken
-				{`XLEN{1'b0}},	//branch_true_target_PC
-				1'b0,		//branch_misprediction
-				{`XLEN{1'b0}}	//branch_true_PC
-				};
-		end
-	end
-////////next_head & next_tail
-	assign	next_tail = id_packet_in_0.valid ? next_3_tail[0] : (id_packet_in_1.valid ? next_3_tail[1] : (id_packet_in_2.valid ? next_3_tail[2] : tail)); 
-	assign	next_head = (commit_array[0] & !next_ROB[next_3_head[1]].commit) ? next_3_head[0] : ((commit_array[1] & !next_ROB[next_3_head[2]].commit) ? next_3_head[1] : ((commit_array[2] & !next_ROB[head].commit) ? next_3_head[2] : head));
-	assign	ROB_num	  = {tail,next_3_tail[2],next_3_tail[1]};
-////////Load&store
-	assign fetch_cnt[2] = id_packet_in_2.valid & id_packet_in_2.wr_mem;
-	assign fetch_cnt[1] = fetch_cnt[2] + (id_packet_in_1.valid & id_packet_in_1.wr_mem);
-	assign fetch_cnt[0] = fetch_cnt[1] + (id_packet_in_0.valid & id_packet_in_0.wr_mem);
-	assign commit_cnt   = 	(commit_array[2] & ROB_packet_out_2.id_packet.wr_mem & !next_ROB[head].commit) + 
-							(commit_array[1] & ROB_packet_out_1.id_packet.wr_mem & !next_ROB[next_3_head[2]].commit) + 
-							(commit_array[0] & ROB_packet_out_0.id_packet.wr_mem & !next_ROB[next_3_head[1]].commit);
-	assign next_tail_cnt= tail_cnt + fetch_cnt[0] - commit_cnt;
-	//counting the store before each instruction
-	always_comb begin
-		for(int i=0;i<`ROB_SIZE;i=i+1) begin
-			if(((next_head<tail)&(i>=next_head)&(i<tail)) | ((next_head>tail)&((i>=next_head)|(i<tail))) | ((next_head==tail)&ROB[next_head].valid)) begin
-				next_store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH] =  store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH] - commit_cnt;
-			end
-			else if(i==tail) begin
-				next_store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH] =  tail_cnt - commit_cnt;
-			end
-			else if(i==next_3_tail[2]) begin
-				next_store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH] =  tail_cnt + fetch_cnt[2] - commit_cnt;
-			end
-			else if(i==next_3_tail[1]) begin
-				next_store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH] =  tail_cnt + fetch_cnt[1] - commit_cnt;
-			end
-			else begin
-				next_store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH] =  next_tail_cnt;				
-			end
-		end
-	end
-	//determing which load inst can be issued
-	always_comb begin
-		for(int i=0;i<`ROB_SIZE;i=i+1) begin
-			load_ready[i] = (store_cnt[i*`ROB_WIDTH +: `ROB_WIDTH]=={`ROB_WIDTH{1'b0}}) & ROB[i].valid & ROB[i].id_packet.rd_mem;
-		end
-	end
-////////ROB_hazard_num
-	always_comb begin
-		if(next_head > next_tail) begin
-			rob_hazard_num = next_head - next_tail;
-		end
-		else if(next_head < next_tail) begin
-			rob_hazard_num = {{1'b1},{`ROB_WIDTH{1'b0}}} - (next_tail - next_head);
-		end
-		else if(next_ROB[next_head].valid) begin
-			rob_hazard_num = {{1'b0},{`ROB_WIDTH{1'b0}}};
-		end
-		else begin
-			rob_hazard_num = {{1'b1},{`ROB_WIDTH{1'b0}}};
-		end
-	end
-////////pipeline error status & completed instructions
-	always_comb begin
-		if(illegal_array[2]) begin
-			error_status = ILLEGAL_INST;
-		end//if(illegal_array[2])
-		else begin
-			if(halt_array[2]) begin
-				error_status = HALTED_ON_WFI;
-			end//if(halt_array[2])
-			else if(illegal_array[1]) begin
-				error_status = ILLEGAL_INST;
-			end//else if(illegal_array[1])
-			else begin
-				if(halt_array[1]) begin
-					error_status = HALTED_ON_WFI;
-				end//if(halt_array[1])
-				else if(illegal_array[0]) begin
-					error_status = ILLEGAL_INST;
-				end//else if(illegal_array[0])
-				else if(halt_array[0]) begin
-					error_status = HALTED_ON_WFI;
-				end//else if(halt_array[0])
+		for(i=0;i<`ROB_DEPTH;i=i+1) begin
+			always@(posedge clk or negedge rst_n) begin
+				if(~rst_n)
+					rob_entry[i] <= 0;
+				else if(pipe_flush)
+					rob_entry[i] <= 0;
 				else begin
-					error_status = NO_ERROR;
-				end
-			end//else
-		end//else
-	end
-	assign completed_insts 	= 	(commit_array[2] & ~(ROB[head].id_packet.wr_mem & ~store_commit_valid)) + 
-								(commit_array[1] & ~(ROB[next_3_head[2]].id_packet.wr_mem & ~store_commit_valid)) + 
-								(commit_array[0] & ~(ROB[next_3_head[1]].id_packet.wr_mem & ~store_commit_valid));
-	
-////////nuke signal 
-	assign	next_nuke = nuke_array[2] | nuke_array[1] | nuke_array[0];
+					/************************writeback***********************/
+					if(rob_entry[i].valid && ~rob_entry[i].complete) begin
+						rob_entry[i].complete	<=	(i==writeback_rob_tag[0][`ROB_WIDTH-1:0] && writeback_valid[0])	||
+											 		(i==writeback_rob_tag[1][`ROB_WIDTH-1:0] && writeback_valid[1])	||
+											 		(i==writeback_rob_tag[2][`ROB_WIDTH-1:0] && writeback_valid[2])	||
+											 		(i==writeback_rob_tag[3][`ROB_WIDTH-1:0] && writeback_valid[3])	||
+											 		(i==writeback_rob_tag[4][`ROB_WIDTH-1:0] && writeback_valid[4])	||
+											 		(i==writeback_rob_tag[5][`ROB_WIDTH-1:0] && writeback_valid[5])	||
+											 		(i==writeback_rob_tag[6][`ROB_WIDTH-1:0] && writeback_valid[6]);
+                    	                                                          
+						rob_entry[i].branch_misp <= (i==writeback_rob_tag[5][`ROB_WIDTH-1:0] && writeback_valid[5] && writeback_br_misp);
+					end
 
-	
-	always_ff @(posedge clock) begin
-		if(reset | nuke) begin
-			head <= `SD 1'b0;
-			tail <= `SD 1'b0;
-			for(int i=0; i<`ROB_SIZE; i=i+1) begin
-				ROB[i].valid				<= `SD 1'b0;
-				ROB[i].commit				<= `SD 1'b0;
-				ROB[i].branch_true_taken 		<= `SD 1'b0;
-				ROB[i].branch_true_target_PC 		<= `SD {`XLEN{1'b0}};
-				ROB[i].branch_mispredict 		<= `SD 1'b0;
-				ROB[i].branch_true_PC 			<= `SD {`XLEN{1'b0}};
-				ROB[i].proc2mem_addr 			<= `SD {`XLEN{1'b0}};
-				ROB[i].proc2mem_data 			<= `SD 64'b0;
-				ROB[i].proc2mem_size 			<= `SD DOUBLE;
-				ROB[i].id_packet 			<= `SD {{`XLEN{1'b0}},		//NPC
-													{`XLEN{1'b0}}, 		//PC
-													{4'b0001},		//FU_type
-													{`PRF_WIDTH{1'b0}},	//rs1_prf_value
-													1'b0,			//rs1_use_prf
-													1'b0,			//rs1_prf_valid
-													{`XLEN{1'b0}}, 		//rs1_nprf_value
-													1'b0,			//rs1_is_nprf
-													{`PRF_WIDTH{1'b0}}, 	//rs2_prf_value
-													1'b0,			//rs2_use_prf
-													1'b0,			//rs2_prf_valid
-													20'b0, 			//rs2_nprf_value
-													1'b0,			//rs2_is_imm
-													OPA_IS_RS1, 		//opa_select
-													OPB_IS_RS2, 		//opb_select
-													`NOP,			//inst
-													`ZERO_REG,		//dest_reg_idx
-													{`PRF_WIDTH{1'b0}}, 	//dest_prf_reg
-													{`PRF_WIDTH{1'b0}},	//dest_old_prn
-													ALU_ADD, 		//alu_func
-													1'b0, 			//rd_mem
-													1'b0, 			//wr_mem
-													1'b0, 			//cond
-													1'b0, 			//uncond
-													1'b0,			//branch_predict
-													{`XLEN{1'b0}},		//predict_PC
-													1'b0, 			//halt
-													1'b0, 			//illegal
-													1'b0, 			//csr_op
-													1'b0 			//valid
-													};
-			end
-			nuke 		<= `SD 1'b0;
-			tail_cnt 	<= `SD {`ROB_WIDTH{1'b0}};
-			store_cnt	<= `SD {((`ROB_SIZE)*(`ROB_WIDTH)){1'b0}};
+					/*************************retire*************************/
+					if(retire_en[0] && i==head_ptr)
+						rob_entry[i].valid <= 0;
+					if(retire_en[1] && i==head_ptr_plus1)
+						rob_entry[i].valid <= 0;
+					if(retire_en[2] && i==head_ptr_plus2)
+						rob_entry[i].valid <= 0;
+					if(retire_en[3] && i==head_ptr_plus3)
+						rob_entry[i].valid <= 0;
+
+
+
+					/************************allocate************************/
+					if(dispatch_pkt[0].packet_valid) begin	//1111/0111/0011/0001 instr are valid
+						if(i==tail_ptr)
+							rob_entry[i] <= dispatch_2_rob[0];
+						else if(i==tail_ptr_plus1 && dispatch_2_rob[1].valid)
+							rob_entry[i] <= dispatch_2_rob[1];
+						else if(i==tail_ptr_plus2 && dispatch_2_rob[2].valid)
+							rob_entry[i] <= dispatch_2_rob[2];							
+						else if(i==tail_ptr_plus3 && dispatch_2_rob[3].valid)
+							rob_entry[i] <= dispatch_2_rob[3];
+					end
+					else if(dispatch_pkt[1].packet_valid) begin	//1110/0110/0010 instr are valid
+						if(i==tail_ptr)
+							rob_entry[i] <= dispatch_2_rob[1];
+						else if(i==tail_ptr_plus1 && dispatch_2_rob[2].valid)
+							rob_entry[i] <= dispatch_2_rob[2];
+						else if(i==tail_ptr_plus2 && dispatch_2_rob[3].valid)
+							rob_entry[i] <= dispatch_2_rob[3];							
+					end
+					else if(dispatch_pkt[2].packet_valid) begin	//1100/0100 instr are valid
+						if(i==tail_ptr)
+							rob_entry[i] <= dispatch_2_rob[2];
+						else if(i==tail_ptr_plus1 && dispatch_2_rob[3].valid)
+							rob_entry[i] <= dispatch_2_rob[3];
+					end
+					else if(dispatch_pkt[3].packet_valid) begin	//1000 instr are valid
+						if(i==tail_ptr)
+							rob_entry[i] <= dispatch_2_rob[3];
+					end
+				end	    		
+			end	
+		
 		end
-		else begin
-			head <= `SD next_head;
-			tail <= `SD next_tail;
-			ROB  <= `SD next_ROB;
-			nuke <= `SD next_nuke;
-			tail_cnt  <= `SD next_tail_cnt;
-			store_cnt <= `SD next_store_cnt;
+	endgenerate
+
+
+
+	assign retire_pkt[0].pc 						= rob_entry[head_ptr].pc;
+	assign retire_pkt[0].dest_arn 					= rob_entry[head_ptr].dest_arn;
+	assign retire_pkt[0].dest_prn 					= rob_entry[head_ptr].dest_prn;
+	assign retire_pkt[0].dest_prn_prev 				= rob_entry[head_ptr].dest_prn_prev;
+	assign retire_pkt[0].stq_tag	 				= rob_entry[head_ptr].stq_tag;
+	assign retire_pkt[0].ldq_tag	 				= rob_entry[head_ptr].ldq_tag;
+	assign retire_pkt[0].rd_mem						= rob_entry[head_ptr].rd_mem;
+	assign retire_pkt[0].wr_mem						= rob_entry[head_ptr].wr_mem;
+	assign retire_pkt[0].branch_misp				= rob_entry[head_ptr].branch_misp;
+	assign retire_pkt[0].redirect_pc				= redirect_pc;
+	assign retire_pkt[0].exception					= rob_entry[head_ptr].exception;
+	assign retire_pkt[0].rob_tag[`ROB_WIDTH]	 	= head_position_bit;
+	assign retire_pkt[0].rob_tag[`ROB_WIDTH-1:0]	= head_ptr;
+	assign retire_pkt[0].packet_valid				= retire_en[0];
+
+	assign retire_pkt[1].pc 						= rob_entry[head_ptr_plus1].pc;
+	assign retire_pkt[1].dest_arn 					= rob_entry[head_ptr_plus1].dest_arn;
+	assign retire_pkt[1].dest_prn 					= rob_entry[head_ptr_plus1].dest_prn;
+	assign retire_pkt[1].dest_prn_prev 				= rob_entry[head_ptr_plus1].dest_prn_prev;
+	assign retire_pkt[1].stq_tag	 				= rob_entry[head_ptr_plus1].stq_tag;
+	assign retire_pkt[1].ldq_tag	 				= rob_entry[head_ptr_plus1].ldq_tag;
+	assign retire_pkt[1].rd_mem						= rob_entry[head_ptr_plus1].rd_mem;
+	assign retire_pkt[1].wr_mem						= rob_entry[head_ptr_plus1].wr_mem;
+	assign retire_pkt[1].branch_misp				= rob_entry[head_ptr_plus1].branch_misp;
+	assign retire_pkt[1].redirect_pc				= redirect_pc;
+	assign retire_pkt[1].exception					= rob_entry[head_ptr_plus1].exception;
+	assign retire_pkt[1].rob_tag[`ROB_WIDTH]	 	= head_position_bit;
+	assign retire_pkt[1].rob_tag[`ROB_WIDTH-1:0]	= head_ptr_plus1;
+	assign retire_pkt[1].packet_valid				= retire_en[1];
+
+	assign retire_pkt[2].pc 						= rob_entry[head_ptr_plus2].pc;
+	assign retire_pkt[2].dest_arn 					= rob_entry[head_ptr_plus2].dest_arn;
+	assign retire_pkt[2].dest_prn 					= rob_entry[head_ptr_plus2].dest_prn;
+	assign retire_pkt[2].dest_prn_prev 				= rob_entry[head_ptr_plus2].dest_prn_prev;
+	assign retire_pkt[2].stq_tag	 				= rob_entry[head_ptr_plus2].stq_tag;
+	assign retire_pkt[2].ldq_tag	 				= rob_entry[head_ptr_plus2].ldq_tag;
+	assign retire_pkt[2].rd_mem						= rob_entry[head_ptr_plus2].rd_mem;
+	assign retire_pkt[2].wr_mem						= rob_entry[head_ptr_plus2].wr_mem;
+	assign retire_pkt[2].branch_misp				= rob_entry[head_ptr_plus2].branch_misp;
+	assign retire_pkt[2].redirect_pc				= redirect_pc;
+	assign retire_pkt[2].exception					= rob_entry[head_ptr_plus2].exception;
+	assign retire_pkt[2].rob_tag[`ROB_WIDTH]	 	= head_position_bit;
+	assign retire_pkt[2].rob_tag[`ROB_WIDTH-1:0]	= head_ptr_plus2;
+	assign retire_pkt[2].packet_valid				= retire_en[2];
+
+	assign retire_pkt[3].pc 						= rob_entry[head_ptr_plus3].pc;
+	assign retire_pkt[3].dest_arn 					= rob_entry[head_ptr_plus3].dest_arn;
+	assign retire_pkt[3].dest_prn 					= rob_entry[head_ptr_plus3].dest_prn;
+	assign retire_pkt[3].dest_prn_prev 				= rob_entry[head_ptr_plus3].dest_prn_prev;
+	assign retire_pkt[3].stq_tag	 				= rob_entry[head_ptr_plus3].stq_tag;
+	assign retire_pkt[3].ldq_tag	 				= rob_entry[head_ptr_plus3].ldq_tag;
+	assign retire_pkt[3].rd_mem						= rob_entry[head_ptr_plus3].rd_mem;
+	assign retire_pkt[3].wr_mem						= rob_entry[head_ptr_plus3].wr_mem;
+	assign retire_pkt[3].branch_misp				= rob_entry[head_ptr_plus3].branch_misp;
+	assign retire_pkt[3].redirect_pc				= redirect_pc;
+	assign retire_pkt[3].exception					= rob_entry[head_ptr_plus3].exception;
+	assign retire_pkt[3].rob_tag[`ROB_WIDTH]	 	= head_position_bit;
+	assign retire_pkt[3].rob_tag[`ROB_WIDTH-1:0]	= head_ptr_plus3;
+	assign retire_pkt[3].packet_valid				= retire_en[3];
+
+
+	always@(*) begin
+		if(dispatch_pkt[0].packet_valid) begin	//1111 instr are valid
+			dispatch_pkt_resp[0][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr<4 ? ~tail_position_bit : tail_position_bit ;				
+			dispatch_pkt_resp[1][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr_plus1<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[2][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr_plus2<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[3][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr_plus3<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[0][`ROB_WIDTH-1:0]	= tail_ptr;	
+			dispatch_pkt_resp[1][`ROB_WIDTH-1:0]	= tail_ptr_plus1;	
+			dispatch_pkt_resp[2][`ROB_WIDTH-1:0]	= tail_ptr_plus2;	
+			dispatch_pkt_resp[3][`ROB_WIDTH-1:0]	= tail_ptr_plus3;	
 		end
-	end	
+		else if(dispatch_pkt[1].packet_valid) begin	//1110 instr are valid
+			dispatch_pkt_resp[0][`ROB_WIDTH] 		= 0;				
+			dispatch_pkt_resp[1][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[2][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr_plus1<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[3][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr_plus2<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[0][`ROB_WIDTH-1:0]	= 0;	
+			dispatch_pkt_resp[1][`ROB_WIDTH-1:0]	= tail_ptr;	
+			dispatch_pkt_resp[2][`ROB_WIDTH-1:0]	= tail_ptr_plus1;	
+			dispatch_pkt_resp[3][`ROB_WIDTH-1:0]	= tail_ptr_plus2;	
+		end
+		else if(dispatch_pkt[2].packet_valid) begin	//1100 instr are valid
+			dispatch_pkt_resp[0][`ROB_WIDTH] 		= 0;				
+			dispatch_pkt_resp[1][`ROB_WIDTH] 		= 0;				
+			dispatch_pkt_resp[2][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[3][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr_plus1<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[0][`ROB_WIDTH-1:0]	= 0;	
+			dispatch_pkt_resp[1][`ROB_WIDTH-1:0]	= 0;	
+			dispatch_pkt_resp[2][`ROB_WIDTH-1:0]	= tail_ptr;	
+			dispatch_pkt_resp[3][`ROB_WIDTH-1:0]	= tail_ptr_plus1;	
+		end
+		else if(dispatch_pkt[3].packet_valid) begin	//1000 instr are valid
+			dispatch_pkt_resp[0][`ROB_WIDTH] 		= 0;				
+			dispatch_pkt_resp[1][`ROB_WIDTH] 		= 0;				
+			dispatch_pkt_resp[2][`ROB_WIDTH] 		= 0;				
+			dispatch_pkt_resp[3][`ROB_WIDTH] 		= tail_ptr_overflow && tail_ptr<4 ? ~tail_position_bit : tail_position_bit;				
+			dispatch_pkt_resp[0][`ROB_WIDTH-1:0]	= 0;	
+			dispatch_pkt_resp[1][`ROB_WIDTH-1:0]	= 0;	
+			dispatch_pkt_resp[2][`ROB_WIDTH-1:0]	= 0;	
+			dispatch_pkt_resp[3][`ROB_WIDTH-1:0]	= tail_ptr;	
+		end
+	end
+
+
 
 endmodule
-
